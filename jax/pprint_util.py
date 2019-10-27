@@ -23,16 +23,41 @@ class PrettyPrint(object):
   """Crude Hughes-inspired pretty printer."""
 
   def __init__(self, lines):
+    """
+    Args:
+      lines: array of pairs (indent, string)
+    """
     self.lines = lines
 
   def indent(self, indent):
+    """Creates a PrettyPrinter with some indention added to each line.
+    Args:
+      indent: integer
+    """
     return PrettyPrint([(indent + orig_indent, s)
                         for orig_indent, s in self.lines])
 
   def __add__(self, rhs):
+    """Concatenation."""
     return PrettyPrint(self.lines + rhs.lines)
 
   def __rshift__(self, rhs):
+    """Appends `rhs` indented after last line.
+
+    The first line of `rhs` is appended to the last line of `self`, along with
+    its indentation. Subsequent lines of `rhs` are further indented to keep
+    the alignment with the first line of `rhs`.
+
+    For example::
+    >>>p1 = PrettyPrint([(1, "first"), (3, "second")]))
+    >>>p1 >> p1
+     first
+       second first
+                second
+
+    Args:
+      rhs: a PrettyPrinter
+    """
     if not rhs.lines:
       return self
 
@@ -51,8 +76,11 @@ def pp(s):
   return PrettyPrint([(0, line) for line in str(s).splitlines()])
 
 
-def hcat(ps):
-  return reduce(lambda x, y: x >> y, ps)
+def hcat(ps, sep=pp('')):
+  if not ps:
+    return pp('')
+  else:
+    return reduce(lambda x, y: x >> sep >> y, ps)
 
 
 def vcat(ps):

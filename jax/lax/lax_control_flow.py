@@ -21,6 +21,7 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import inspect
 import itertools
 import operator
 import threading
@@ -646,6 +647,10 @@ def _scan_partial_eval(trace, *tracers, **kwargs):
     jaxpr_1, jaxpr_2, out_uk = pe.partial_eval_jaxpr(
         jaxpr, unknowns, instantiate=carry_uk + [False] * num_ys)
     carry_uk_out, ys_uk = out_uk[:num_carry], out_uk[num_carry:]
+    # Are there elements of
+    for i in range(len(carry_uk)):
+      if carry_uk[i] and not carry_uk_out[i]:
+        assert False
     if carry_uk_out == carry_uk:
       break
     else:

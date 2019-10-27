@@ -23,12 +23,13 @@ import itertools as it
 from weakref import ref
 import threading
 import types
+import numpy as onp
 
 import six
 
 from . import linear_util as lu
-from .util import safe_zip, safe_map, partial, curry
-from .pprint_util import pp, vcat, hcat, pp_kv_pairs
+from .util import safe_zip, safe_map, partial, curry, split_dict, split_list
+from .pprint_util import PrettyPrint, pp, vcat, hcat, pp_kv_pairs
 
 # TODO(dougalm): the trace cache breaks the leak detector. Consisder solving.
 check_leaks = False
@@ -662,3 +663,235 @@ def pp_jaxpr(jaxpr):
           ((pp('let ') >>
             vcat(map(pp_eqn, jaxpr.eqns))) +
            pp('in {} }}'.format(jaxpr.outvars))).indent(2))
+
+
+class JaxprPrinter(object):
+
+  def __init__(self, raw=False, inline_consts=True,
+               sugar_primitives=True):
+    """Configures a pretty printer.
+
+    Args:
+      raw: if True then sets all the other configuration flags to show
+        raw jaxpr.
+      inline_consts: inline small constants.
+      sugar_primitives: tries to simplify the primitives
+    """
+    self.inline_consts = inline_consts
+    self.sugar_primitives = sugar_primitives
+    if raw:
+      self.inline_consts = False
+      self.sugar_primitives = False
+    self.inline_const_max_size = 8
+    self.const_counter = it.count()
+
+    self.var_rewrites = {}  # Map Var from jaxpr to a string
+    self.next_var_count = 0
+    # Stack of scopes, last is current. Each scope is a pair with
+    # value of next_var_count on entering, and the list of orig_vars
+    # defined in the scope.
+    self.scopes = []
+
+  def push_scope(self):
+    """Starts a new scope."""
+    self.scopes.append((self.next_var_count, []))
+
+  def pop_scope(self, pp):
+    """Pops the current scope.
+    Args:
+      pp: a PrettyPrinter to return after poping the scope
+    """
+    curr_scope = self.scopes.pop()
+    self.next_var_count = curr_scope[0]
+    for v in curr_scope[1]:
+      del self.var_rewrites[v]
+    return pp
+
+  def define_vars(self, orig_vars, vals):
+    """Defines some Vars in the current scope.
+    Args:
+      orig_vars: list of Vars
+      vals: optional string for the values of the var, if known
+    Returns:
+      a string with the new Vars separated by spaces. Only the vars that
+        do not have a "val" are included.
+    """
+    assert len(orig_vars) == len(vals)
+    new_vars = []
+    for orig_var, val_pp in zip(orig_vars, vals):
+      self.scopes[-1][1].append(orig_var)
+      if val_pp is not None:
+        if not isinstance(val_pp, str):
+          val_pp = str(val_pp)
+        self.var_rewrites[orig_var] = val_pp
+      else:
+        new_var = Var(self.next_var_count, orig_var.suffix)
+        self.next_var_count += 1
+        self.var_rewrites[orig_var] = str(new_var)
+        new_vars.append(str(new_var))
+
+    return " ".join(new_vars)
+
+  def use_var(self, orig_var):
+    """A string for a Var or Literal usage."""
+    if isinstance(orig_var, Var):
+      return self.var_rewrites[orig_var]
+    else:
+      return str(orig_var)
+
+  def use_vars(self, orig_vars):
+    """A list of string for a list of Var usages."""
+    return map(self.use_var, orig_vars)
+
+  def main(self, jaxpr, consts):
+    """Entry point for pretty printing a jaxpr and the constant values."""
+    assert len(jaxpr.constvars) == len(consts)
+    self.push_scope()
+    # Pre-process the constants and build the legend
+    legend_pp = []
+    use_constvals = []  # Strings with values
+    old_print_options = onp.get_printoptions()
+    onp.set_printoptions(threshold=8)
+    for const in consts:
+      const_size = onp.size(const)
+      if self.inline_consts and const_size <= self.inline_const_max_size:
+        use_constvals.append(pp(str(const)))
+      else:
+        # TODO: shorten the printed constant for the legend
+        use_constvar = "const_{}".format(next(self.const_counter))
+        use_constvals.append(use_constvar)
+        legend_pp.append(pp(use_constvar + ' = ') >> pp(str(const)))
+    onp.set_printoptions(threshold=old_print_options['threshold'])
+
+    pjaxpr = self.pp_jaxpr(jaxpr, use_constvals, [],
+                           [None] * len(jaxpr.invars))
+    return self.pop_scope(pjaxpr + vcat(legend_pp))
+
+  def pp_jaxpr(self, jaxpr, constvar_values, freevar_values, invar_values):
+    """Pretty print a jaxpr, inlining constvars, freevars and invars
+    Args:
+      the values are lists of string, or of None
+    """
+    self.push_scope()
+    constvars = self.define_vars(jaxpr.constvars, constvar_values)
+    freevars = self.define_vars(jaxpr.freevars, freevar_values)
+    invars = self.define_vars(jaxpr.invars, invar_values)
+
+    if self.inline_consts and not constvars and not freevars and not invars:
+      lambda_header = pp('{ lambda .')
+    else:
+      lambda_header = pp('{{ lambda {} ; {} ; {}.'.format(constvars,
+                                                          freevars,
+                                                          invars))
+    eqns_pp = map(self.pp_eqn, jaxpr.eqns)
+    use_outvars = hcat(map(pp, self.use_vars(jaxpr.outvars)), sep=pp(' '))
+    return self.pop_scope(
+      lambda_header +
+      ((pp('let ') >> vcat(eqns_pp)) +
+       pp('in [') >> use_outvars >> pp('] }')).indent(2))
+
+  def pp_eqn(self, eqn):
+    """Pretty print one equation."""
+    # Do this first, to reserve the names for the outvars
+    lhs = self.define_vars(eqn.outvars, [None] * len(eqn.outvars))
+    invars_pp = self.use_vars(eqn.invars)
+    preprocessor = getattr(self, 'preprocess_'+eqn.primitive.name, None) if self.sugar_primitives else None
+    if preprocessor is not None:
+      params = preprocessor(eqn, invars_pp)
+      invars_pp = []
+      bound_subjaxprs = []
+    else:
+      params = eqn.params.items()
+      bound_subjaxprs = eqn.bound_subjaxprs
+
+    pp_subexpr = pp('')
+    if bound_subjaxprs:
+      for subjaxpr, const_vars, bound_vars in bound_subjaxprs:
+        pp_subexpr = pp_subexpr + (
+            self.pp_jaxpr(subjaxpr, const_vars, bound_vars, [None] * len(subjaxpr.invars)).indent(2))
+    return (pp('{} = '.format(lhs)) >>
+            pp(eqn.primitive.name) >> pp_kv_pairs(params)
+            >> pp(' ') >> hcat(map(pp, invars_pp), sep=pp(' '))) + pp_subexpr
+
+  def preprocess_cond(self, eqn, invars_pp):
+    true_jaxpr = eqn.params['true_jaxpr']
+    false_jaxpr = eqn.params['false_jaxpr']
+    pred, true_consts_ops, false_consts_ops = (
+      split_list(invars_pp, [1, len(true_jaxpr.in_avals)])
+    )
+    return [
+      ('pred', pp(pred[0])),
+      ('true_jaxpr',
+       self.pp_jaxpr(true_jaxpr.jaxpr, true_jaxpr.literals, [],
+                     true_consts_ops)),
+      ('false_jaxpr',
+       self.pp_jaxpr(false_jaxpr.jaxpr, false_jaxpr.literals, [],
+                     false_consts_ops))
+    ]
+
+  def preprocess_while(self, eqn, invars_pp):
+    cond_jaxpr, cond_nconsts, body_jaxpr, body_nconsts = (
+      split_dict(eqn.params,
+                 ['cond_jaxpr', 'cond_nconsts', 'body_jaxpr', 'body_nconsts']))
+    cond_consts, body_consts, carry_init = (
+      split_list(invars_pp, [cond_nconsts, body_nconsts])
+    )
+    return [
+      ('cond_jaxpr',
+       self.pp_jaxpr(cond_jaxpr.jaxpr, self.use_vars(cond_jaxpr.literals), [],
+                     cond_consts + [None] * len(carry_init))),
+      ('body_jaxpr',
+       self.pp_jaxpr(body_jaxpr.jaxpr, self.use_vars(body_jaxpr.literals), [],
+                     body_consts + [None] * len(carry_init))),
+      ('init_carry',
+       hcat(map(pp, carry_init), sep=pp(' ')))
+    ]
+
+  def preprocess_xla_call(self, eqn, invars_pp):
+    assert len(eqn.bound_subjaxprs) == 1
+    subjaxpr, consts, freevals = eqn.bound_subjaxprs[0]
+    assert len(subjaxpr.invars) == len(invars_pp)
+    return [
+      ('device', eqn.params['device']),
+      ('backend', eqn.params['backend']),
+      ('body_jaxpr',
+       self.pp_jaxpr(subjaxpr, self.use_vars(consts),
+                     self.use_vars(freevals), invars_pp))
+    ]
+
+  def preprocess_scan(self, eqn, invars_repl):
+    assert len(eqn.bound_subjaxprs) == 0
+    assert len(eqn.params['linear']) == len(invars_repl)
+
+    jaxpr = eqn.params['jaxpr']
+    body_consts, carry_init, inputs = (
+      split_list(invars_repl, [eqn.params['num_consts'], eqn.params['num_carry']])
+    )
+    const_linear, carry_linear, input_linear = (
+      split_list(eqn.params['linear'], [eqn.params['num_consts'], eqn.params['num_carry']])
+    )
+    # Drop from the inputs the '*'
+    filtered_inputs = []
+    filtered_inputs_linear = []
+    inputs_repl = []
+    for i, il in zip(inputs, input_linear):
+      if i != '*':
+        filtered_inputs.append(i)
+        filtered_inputs_linear.append(il)
+        inputs_repl.append(None)
+      else:
+        inputs_repl.append('')
+
+    return [
+      ('forward', eqn.params['forward']),
+      ('length', eqn.params['length']),
+      ('num_carry', eqn.params['num_carry']),
+      ('carry_init', hcat(map(pp, carry_init), sep=pp(' '))),
+      ('inputs', hcat(map(pp, filtered_inputs), sep=pp(' '))),
+      ('carry_linear', carry_linear),
+      ('inputs_linear', filtered_inputs_linear),
+      ('body_jaxpr',
+       self.pp_jaxpr(jaxpr.jaxpr, self.use_vars(jaxpr.literals),
+                     [], body_consts + [None] * len(carry_init) + inputs_repl)),
+
+    ]

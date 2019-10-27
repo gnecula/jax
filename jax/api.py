@@ -1326,8 +1326,8 @@ def make_jaxpr(fun):
     jax_args, in_tree = tree_flatten((args, kwargs))
     jaxtree_fun, out_tree = flatten_fun(wrapped, in_tree)
     pvals = map(pv_like, jax_args)
-    jaxpr, _, _ = pe.trace_to_jaxpr(jaxtree_fun, pvals)
-    return jaxpr
+    jaxpr, _, consts = pe.trace_to_jaxpr(jaxtree_fun, pvals)
+    return jaxpr, consts
 
   jaxpr_maker.__name__ = "make_jaxpr({})".format(jaxpr_maker.__name__)
   return jaxpr_maker
