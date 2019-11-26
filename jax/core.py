@@ -84,6 +84,9 @@ def jaxpr_as_fun(typed_jaxpr, *args):
 JaxprEqn = namedtuple('JaxprEqn', ['invars', 'outvars', 'primitive',
                                    'bound_subjaxprs', 'params'])
 JaxprEqn.__repr__ = JaxprEqn.__str__ = lambda eqn: str(pp_eqn(eqn)).rstrip()
+def bridge_get_bound_jaxpr(eqn):
+  pass
+JaxprEqn.get_bound_jaxpr = bridge_get_bound_jaxpr
 new_jaxpr_eqn = JaxprEqn
 
 
@@ -743,16 +746,21 @@ class JaxprPrinter(object):
     """A list of string for a list of Var usages."""
     return map(self.use_var, orig_vars)
 
-  def main(self, jaxpr, consts):
-    """Entry point for pretty printing a jaxpr and the constant values."""
-    assert len(jaxpr.constvars) == len(consts)
+  def main(self, jaxpr):
+    """Entry point for pretty printing a jaxpr and the constant values.
+
+    Args:
+      jaxpr: a TypedJaxpr to print
+    """
+    assert isinstance(jaxpr, TypedJaxpr)
+
     self.push_scope()
     # Pre-process the constants and build the legend
     legend_pp = []
     use_constvals = []  # Strings with values
     old_print_options = onp.get_printoptions()
     onp.set_printoptions(threshold=8)
-    for const in consts:
+    for const in jaxpr.literals:
       const_size = onp.size(const)
       if self.inline_consts and const_size <= self.inline_const_max_size:
         use_constvals.append(pp(str(const)))
@@ -763,16 +771,23 @@ class JaxprPrinter(object):
         legend_pp.append(pp(use_constvar + ' = ') >> pp(str(const)))
     onp.set_printoptions(threshold=old_print_options['threshold'])
 
-    pjaxpr = self.pp_jaxpr(jaxpr, use_constvals, [],
-                           [None] * len(jaxpr.invars))
+    pjaxpr = self.pp_jaxpr(jaxpr, [],
+                           [None] * len(jaxpr.jaxpr.invars), use_constvals=use_constvals)
     return self.pop_scope(pjaxpr + vcat(legend_pp))
 
-  def pp_jaxpr(self, jaxpr, constvar_values, freevar_values, invar_values):
+  def pp_jaxpr(self, tjaxpr, freevar_values, invar_values, use_constvals=None):
     """Pretty print a jaxpr, inlining constvars, freevars and invars
     Args:
+      tjaxpr: a TypedJaxpr
       the values are lists of string, or of None
     """
+    assert isinstance(tjaxpr, TypedJaxpr)
+    jaxpr = tjaxpr.jaxpr
     self.push_scope()
+    if use_constvals is not None:
+      constvar_values = use_constvals
+    else:
+      constvar_values = self.use_vars(tjaxpr.literals)
     constvars = self.define_vars(jaxpr.constvars, constvar_values)
     freevars = self.define_vars(jaxpr.freevars, freevar_values)
     invars = self.define_vars(jaxpr.invars, invar_values)
@@ -822,10 +837,10 @@ class JaxprPrinter(object):
     return [
       ('pred', pp(pred[0])),
       ('true_jaxpr',
-       self.pp_jaxpr(true_jaxpr.jaxpr, true_jaxpr.literals, [],
+       self.pp_jaxpr(true_jaxpr, [],
                      true_consts_ops)),
       ('false_jaxpr',
-       self.pp_jaxpr(false_jaxpr.jaxpr, false_jaxpr.literals, [],
+       self.pp_jaxpr(false_jaxpr, [],
                      false_consts_ops))
     ]
 
@@ -838,10 +853,10 @@ class JaxprPrinter(object):
     )
     return [
       ('cond_jaxpr',
-       self.pp_jaxpr(cond_jaxpr.jaxpr, self.use_vars(cond_jaxpr.literals), [],
+       self.pp_jaxpr(cond_jaxpr, [],
                      cond_consts + [None] * len(carry_init))),
       ('body_jaxpr',
-       self.pp_jaxpr(body_jaxpr.jaxpr, self.use_vars(body_jaxpr.literals), [],
+       self.pp_jaxpr(body_jaxpr, [],
                      body_consts + [None] * len(carry_init))),
       ('init_carry',
        hcat(map(pp, carry_init), sep=pp(' ')))
@@ -850,13 +865,18 @@ class JaxprPrinter(object):
   def preprocess_xla_call(self, eqn, invars_pp):
     assert len(eqn.bound_subjaxprs) == 1
     subjaxpr, consts, freevals = eqn.bound_subjaxprs[0]
-    assert len(subjaxpr.invars) == len(invars_pp)
+    # Convert to regular jaxpr
+    jaxpr1 = Jaxpr(subjaxpr.constvars + subjaxpr.freevars,
+                   [], subjaxpr.invars, subjaxpr.outvars, subjaxpr.eqns)
+    jaxpr2 = TypedJaxpr(jaxpr1, consts + freevals,
+               [abstract_unit] * len(jaxpr1.invars),
+              [abstract_unit] * len(jaxpr1.outvars))
+    assert len(jaxpr1.invars) == len(invars_pp)
     return [
       ('device', eqn.params['device']),
       ('backend', eqn.params['backend']),
       ('body_jaxpr',
-       self.pp_jaxpr(subjaxpr, self.use_vars(consts),
-                     self.use_vars(freevals), invars_pp))
+       self.pp_jaxpr(jaxpr2, [], invars_pp))
     ]
 
   def preprocess_scan(self, eqn, invars_repl):
@@ -891,7 +911,7 @@ class JaxprPrinter(object):
       ('carry_linear', carry_linear),
       ('inputs_linear', filtered_inputs_linear),
       ('body_jaxpr',
-       self.pp_jaxpr(jaxpr.jaxpr, self.use_vars(jaxpr.literals),
+       self.pp_jaxpr(jaxpr,
                      [], body_consts + [None] * len(carry_init) + inputs_repl)),
 
     ]

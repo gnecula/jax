@@ -62,8 +62,8 @@ def set_env(test_name=''):
 
 
 def show_jaxpr_and_result(what, f, *args):
-  jaxpr, consts = api.make_jaxpr(f)(*args)
-  print("\n{}_jaxpr={}{}_consts=[{}]".format(what, jaxpr, what, consts))
+  jaxpr = api.make_jaxpr(f)(*args)
+  print("\n{}_jaxpr={}{}".format(what, jaxpr, what))
   res = f(*args)
   print("{}_res={}".format(what, res))
   return res
@@ -908,7 +908,7 @@ def pp_jaxpr(fun, **pp_flags):
   def wrapped(*args, **kwargs):
     jaxpr = api.make_jaxpr(fun)(*args, **kwargs)
     printer = core.JaxprPrinter(**pp_flags)
-    return printer.main(jaxpr.jaxpr, jaxpr.literals)
+    return printer.main(jaxpr)
   return wrapped
 
 
@@ -1003,8 +1003,8 @@ class JaxprPrintTests(jtu.JaxTestCase):
       return lax.cond(arg1 >= 0.,
                       arg2,
                       lambda xtrue: xtrue[0] + 3.,
-                      arg2,
-                      lambda xfalse: xfalse[1] + jnp.ones(1))
+                      jnp.ones(1),
+                      lambda xfalse: jnp.sum(xfalse))
 
     print(api.make_jaxpr(func8)(5., (1., 2.)))
     print(pp_jaxpr(func8, sugar_primitives=False, inline_consts=False)(5., (1., 2.)))
@@ -1047,6 +1047,7 @@ class JaxprPrintTests(jtu.JaxTestCase):
       return arg + inner(arg - 2.)
 
     print(api.make_jaxpr(func12)(1.))
+    print(pp_jaxpr(func12)(1.))
 
   def test_jit_1(self):
 
