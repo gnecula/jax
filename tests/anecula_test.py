@@ -906,13 +906,16 @@ def make_jaxpr_and_consts(fun, *args):
 
 def pp_jaxpr(fun, **pp_flags):
   def wrapped(*args, **kwargs):
-    jaxpr, consts = api.make_jaxpr(fun)(*args, **kwargs)
+    jaxpr = api.make_jaxpr(fun)(*args, **kwargs)
     printer = core.JaxprPrinter(**pp_flags)
-    return printer.main(jaxpr, consts)
+    return printer.main(jaxpr.jaxpr, jaxpr.literals)
   return wrapped
 
 
 class JaxprPrintTests(jtu.JaxTestCase):
+
+  def setUp(self) -> None:
+    pass # raise SkipTest("Disabled for now")
 
   def test_0(self):
     """No constants"""
@@ -933,9 +936,9 @@ class JaxprPrintTests(jtu.JaxTestCase):
     print("Use on vectors")
     arg_first = onp.ones(16)
     arg_second = arg_first
-    print(api.make_jaxpr(func)(arg_first, arg_second))
-    print(pp_jaxpr(func, raw=True)(arg_first, arg_second))
-    print(pp_jaxpr(func)(arg_first, arg_second))
+    print(api.make_jaxpr(func1)(arg_first, arg_second))
+    print(pp_jaxpr(func1, raw=True)(arg_first, arg_second))
+    print(pp_jaxpr(func1)(arg_first, arg_second))
 
 
   def test_trace_through(self):
@@ -1184,10 +1187,29 @@ class JaxprPrintTests(jtu.JaxTestCase):
     print(api.make_jaxpr(ff)(10.))
     print(pp_jaxpr(ff)(10.))
 
+  def testWithLiteralAndCond(self):
+    def f(x):
+      y = lax.cond(True,
+                   1.,
+                   lambda xt: (xt, 1.),
+                   2.,
+                   lambda xf: (xf, 2.))
+      return (y, 1., jnp.ones(2))
+
+    print(api.make_jaxpr(f)(10.))
+    print(pp_jaxpr(f)(10.))
+
   def test_pp(self):
     from jax import pprint_util as ppu
     p1 = ppu.PrettyPrint([(1, "first"), (3, "second")])
     print(p1 >> p1)
+
+  def testWithLiteral(self):
+    def f(x):
+      return (x, 1., jnp.ones(1))
+
+    print(api.make_jaxpr(f)(10.))
+    print(pp_jaxpr(f)(10.))
 
 
 
