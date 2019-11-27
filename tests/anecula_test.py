@@ -1060,6 +1060,19 @@ class JaxprPrintTests(jtu.JaxTestCase):
     print(api.make_jaxpr(api.jit(func13))(1.))
     print(pp_jaxpr(api.jit(func13))(1.))
 
+  def test_pmap(self):
+    def func13(arr, extra):
+      def inner(x):
+        # use a free variable “extra” and a constant jnp.ones(...)
+        return (x + extra + jnp.ones(1)) / lax.psum(x, axis_name='rows')
+      return api.pmap(inner, axis_name='rows')(arr)
+
+    print("Use on scalars")
+    arr = onp.ones((1, 3))
+    print(api.make_jaxpr(func13)(arr, 5.))
+    print(pp_jaxpr(func13)(arr, 5.))
+
+
 
   def test_10(self):
     def f(first, second):
@@ -1081,6 +1094,9 @@ class JaxprPrintTests(jtu.JaxTestCase):
     print(api.make_jaxpr(f)(arg_first, arg_second))
     print(pp_jaxpr(f, raw=True)(arg_first, arg_second))
     print(pp_jaxpr(f)(arg_first, arg_second))
+
+
+
 
   def test_cond2(self):
     def f(arg):

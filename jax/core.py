@@ -689,6 +689,7 @@ class JaxprPrinter(object):
     self.const_counter = it.count()
 
     self.var_rewrites = {}  # Map Var from jaxpr to a string
+
     self.next_var_count = 0
     # Stack of scopes, last is current. Each scope is a pair with
     # value of next_var_count on entering, and the list of orig_vars
@@ -710,30 +711,37 @@ class JaxprPrinter(object):
       del self.var_rewrites[v]
     return pp
 
-  def define_vars(self, orig_vars, vals):
+  def define_vars(self, orig_vars, vals, val_types):
     """Defines some Vars in the current scope.
     Args:
       orig_vars: list of Vars
-      vals: optional string for the values of the var, if known
-    Returns:
+      vals: list of optional string for the values of the orig_vars,
+        if known. If a value is given, then the variable will be inlined.
+      val_types: optional list of abstract types representing the types for vals.
+    Returns: a pair
       a string with the new Vars separated by spaces. Only the vars that
-        do not have a "val" are included.
+        are not inlined are included.
+      a list with typing declarations (each is a string)
     """
     assert len(orig_vars) == len(vals)
     new_vars = []
-    for orig_var, val_pp in zip(orig_vars, vals):
+    new_var_type_decls = []
+    if val_types is None:
+      val_types = [None] * len(orig_vars)
+    for orig_var, val, val_type in zip(orig_vars, vals, val_types):
       self.scopes[-1][1].append(orig_var)
-      if val_pp is not None:
-        if not isinstance(val_pp, str):
-          val_pp = str(val_pp)
-        self.var_rewrites[orig_var] = val_pp
+      if val is not None:
+        if not isinstance(val, str):
+          val = str(val)
+        self.var_rewrites[orig_var] = val
       else:
         new_var = Var(self.next_var_count, orig_var.suffix)
         self.next_var_count += 1
         self.var_rewrites[orig_var] = str(new_var)
         new_vars.append(str(new_var))
-
-    return " ".join(new_vars)
+        if val_type is not None:
+          new_var_type_decls.append(self.pp_type_decl(new_var, val_type))
+    return (" ".join(new_vars), new_var_type_decls)
 
   def use_var(self, orig_var):
     """A string for a Var or Literal usage."""
@@ -743,8 +751,17 @@ class JaxprPrinter(object):
       return str(orig_var)
 
   def use_vars(self, orig_vars):
-    """A list of string for a list of Var usages."""
+    """A list of strings for a list of Var usages."""
     return map(self.use_var, orig_vars)
+
+  def pp_type_decl(self, varname, absval):
+    def pp_type(absval):
+      if not hasattr(absval, "shape"):
+        return "?"
+      else:
+        return "{}[{}]".format(absval.dtype,
+                               ",".join([str(d) for d in list(absval.shape)]))
+    return "{}: {}".format(varname, pp_type(absval))
 
   def main(self, jaxpr):
     """Entry point for pretty printing a jaxpr and the constant values.
@@ -772,14 +789,18 @@ class JaxprPrinter(object):
     onp.set_printoptions(threshold=old_print_options['threshold'])
 
     pjaxpr = self.pp_jaxpr(jaxpr, [],
-                           [None] * len(jaxpr.jaxpr.invars), use_constvals=use_constvals)
+                           [None] * len(jaxpr.jaxpr.invars),
+                           use_constvals=use_constvals)
     return self.pop_scope(pjaxpr + vcat(legend_pp))
 
-  def pp_jaxpr(self, tjaxpr, freevar_values, invar_values, use_constvals=None):
+  def pp_jaxpr(self, tjaxpr, freevar_values, invar_values,
+               use_constvals=None, constvar_types=None):
     """Pretty print a jaxpr, inlining constvars, freevars and invars
     Args:
       tjaxpr: a TypedJaxpr
       the values are lists of string, or of None
+      use_constvals: if given, then a list of strings to be used as values
+        for the constvars. Otherwise, tjaxpr.literals is used.
     """
     assert isinstance(tjaxpr, TypedJaxpr)
     jaxpr = tjaxpr.jaxpr
@@ -788,9 +809,12 @@ class JaxprPrinter(object):
       constvar_values = use_constvals
     else:
       constvar_values = self.use_vars(tjaxpr.literals)
-    constvars = self.define_vars(jaxpr.constvars, constvar_values)
-    freevars = self.define_vars(jaxpr.freevars, freevar_values)
-    invars = self.define_vars(jaxpr.invars, invar_values)
+    constvars, constvars_types_pp = self.define_vars(
+      jaxpr.constvars, constvar_values, constvar_types)
+    freevars, freevar_types_pp = self.define_vars(
+      jaxpr.freevars, freevar_values, None)
+    invars, invars_types_pp = self.define_vars(
+      jaxpr.invars, invar_values, tjaxpr.in_avals)
 
     if self.inline_consts and not constvars and not freevars and not invars:
       lambda_header = pp('{ lambda .')
@@ -798,19 +822,32 @@ class JaxprPrinter(object):
       lambda_header = pp('{{ lambda {} ; {} ; {}.'.format(constvars,
                                                           freevars,
                                                           invars))
+      var_type_decls = ", ".join(constvars_types_pp +
+                                  freevar_types_pp + invars_types_pp)
+      if var_type_decls:
+        lambda_header += pp("  # " + var_type_decls)
+
     eqns_pp = map(self.pp_eqn, jaxpr.eqns)
-    use_outvars = hcat(map(pp, self.use_vars(jaxpr.outvars)), sep=pp(' '))
+    outvars_strs = self.use_vars(jaxpr.outvars)
+    assert len(tjaxpr.out_avals) == len(outvars_strs)
+    out_type_decl = ", ".join([
+      self.pp_type_decl(ov, oabs)
+      for ov, oabs in zip(outvars_strs, tjaxpr.out_avals)])
+    use_outvars = hcat(map(pp, outvars_strs), sep=pp(' '))
     return self.pop_scope(
       lambda_header +
       ((pp('let ') >> vcat(eqns_pp)) +
+       pp('# ' + out_type_decl) +
        pp('in [') >> use_outvars >> pp('] }')).indent(2))
+
 
   def pp_eqn(self, eqn):
     """Pretty print one equation."""
     # Do this first, to reserve the names for the outvars
-    lhs = self.define_vars(eqn.outvars, [None] * len(eqn.outvars))
+    lhs, lhs_type_decls = self.define_vars(eqn.outvars, [None] * len(eqn.outvars), None)
     invars_pp = self.use_vars(eqn.invars)
-    preprocessor = getattr(self, 'preprocess_'+eqn.primitive.name, None) if self.sugar_primitives else None
+    preprocessor = (getattr(self, 'preprocess_'+eqn.primitive.name, None)
+                    if self.sugar_primitives else None)
     if preprocessor is not None:
       params = preprocessor(eqn, invars_pp)
       invars_pp = []
@@ -823,11 +860,13 @@ class JaxprPrinter(object):
     if bound_subjaxprs:
       for subjaxpr, const_vars, bound_vars in bound_subjaxprs:
         pp_subexpr = pp_subexpr + (
-            self.pp_jaxpr(subjaxpr, const_vars, bound_vars, [None] * len(subjaxpr.invars)).indent(2))
+            self.pp_jaxpr(subjaxpr, const_vars, bound_vars,
+                          [None] * len(subjaxpr.invars)).indent(2))
     return (pp('{} = '.format(lhs)) >>
             pp(eqn.primitive.name) >> pp_kv_pairs(params)
             >> pp(' ') >> hcat(map(pp, invars_pp), sep=pp(' '))) + pp_subexpr
 
+  # These are custom primitive pre-processors
   def preprocess_cond(self, eqn, invars_pp):
     true_jaxpr = eqn.params['true_jaxpr']
     false_jaxpr = eqn.params['false_jaxpr']
@@ -866,18 +905,35 @@ class JaxprPrinter(object):
     assert len(eqn.bound_subjaxprs) == 1
     subjaxpr, consts, freevals = eqn.bound_subjaxprs[0]
     # Convert to regular jaxpr
-    jaxpr1 = Jaxpr(subjaxpr.constvars + subjaxpr.freevars,
-                   [], subjaxpr.invars, subjaxpr.outvars, subjaxpr.eqns)
-    jaxpr2 = TypedJaxpr(jaxpr1, consts + freevals,
+    jaxpr1 = Jaxpr(subjaxpr.constvars,
+                   [], subjaxpr.freevars + subjaxpr.invars, subjaxpr.outvars, subjaxpr.eqns)
+    jaxpr2 = TypedJaxpr(jaxpr1, self.use_vars(consts) ,
                [abstract_unit] * len(jaxpr1.invars),
-              [abstract_unit] * len(jaxpr1.outvars))
-    assert len(jaxpr1.invars) == len(invars_pp)
+               [abstract_unit] * len(jaxpr1.outvars))
     return [
       ('device', eqn.params['device']),
       ('backend', eqn.params['backend']),
       ('body_jaxpr',
-       self.pp_jaxpr(jaxpr2, [], invars_pp))
+       self.pp_jaxpr(jaxpr2, [], self.use_vars(freevals) + invars_pp))
     ]
+
+  def preprocess_xla_pmap(self, eqn, invars_pp):
+    assert len(eqn.bound_subjaxprs) == 1
+    subjaxpr, consts, freevals = eqn.bound_subjaxprs[0]
+    # Convert to regular TypedJaxpr
+    jaxpr1 = Jaxpr(subjaxpr.constvars,
+                   [], subjaxpr.freevars+subjaxpr.invars, subjaxpr.outvars, subjaxpr.eqns)
+    jaxpr2 = TypedJaxpr(jaxpr1, self.use_vars(consts),
+               [abstract_unit] * len(jaxpr1.invars),
+               [abstract_unit] * len(jaxpr1.outvars))
+    return [
+      ('axis_name', eqn.params['axis_name']),
+      ('devices', eqn.params['devices']),
+      ('backend', eqn.params['backend']),
+      ('body_jaxpr',
+       self.pp_jaxpr(jaxpr2, [], self.use_vars(freevals) + invars_pp))
+    ]
+
 
   def preprocess_scan(self, eqn, invars_repl):
     assert len(eqn.bound_subjaxprs) == 0
@@ -915,3 +971,14 @@ class JaxprPrinter(object):
                      [], body_consts + [None] * len(carry_init) + inputs_repl)),
 
     ]
+
+
+class JaxprPrinterTypedValue(object):
+  def _init__(self, val, valtype):
+    """
+    Args:
+      val: a string representation of the value
+      valtype: an abstract type for the value
+    """
+    self.val = val
+    self.valtype = valtype
