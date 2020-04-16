@@ -80,12 +80,14 @@ py_library(
     ],
 )
 
+# All libraries needed only for GPU support should be here.
 py_library(
     name = "gpu_support",
     deps = [
         ":cublas_kernels",
         ":cuda_prng_kernels",
         ":cusolver_kernels",
+        ":host_callback_cuda_py",
     ],
 )
 
@@ -191,6 +193,72 @@ pybind_extension(
         ":kernel_pybind11_helpers",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
+        "@pybind11",
+    ],
+)
+
+cc_library(
+    name = "host_callback_lib",
+    srcs = ["host_callback.cc"],
+    hdrs = ["host_callback.h"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":kernel_helpers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:binary_format",
+    ],
+)
+
+# TODO(necula): this target does not run in OSS
+cc_test(
+    name = "host_callback_test",
+    size = "small",
+    srcs = ["host_callback_test.cc"],
+    deps = [
+        ":host_callback_lib",
+        "//testing/base/public:gunit_main",
+        "@com_google_absl//absl/base:core_headers",
+    ],
+)
+
+pybind_extension(
+    name = "host_callback_cpu_py",
+    srcs = ["host_callback_cpu_py.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    module_name = "host_callback_cpu_py",
+    deps = [
+        ":host_callback_lib",
+        ":kernel_pybind11_helpers",
+        "@pybind11",
+    ],
+)
+
+pybind_extension(
+    name = "host_callback_cuda_py",
+    srcs = ["host_callback_cuda_py.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    module_name = "host_callback_cuda_py",
+    deps = [
+        ":gpu_kernel_helpers",
+        ":host_callback_lib",
+        ":kernel_helpers",
+        ":kernel_pybind11_helpers",
+        "@com_google_absl//absl/base:core_headers",
+        "@local_config_cuda//cuda:cuda_headers",
         "@pybind11",
     ],
 )

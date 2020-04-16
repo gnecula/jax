@@ -322,7 +322,7 @@ def main():
   parser.add_argument(
       "--bazel_options",
       action="append", default=[],
-      help="Additional options to pass to bazel.")
+      help="Additional options to pass to bazel (e.g., -s to show subcommands).")
   args = parser.parse_args()
 
   print(BANNER)
