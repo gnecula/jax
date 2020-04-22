@@ -41,9 +41,8 @@ class InfeedTest(jax.test_util.JaxTestCase):
     x = onp.float32(1.5)
     y = onp.reshape(onp.arange(12, dtype=onp.float32), (3, 4)) # onp.random.randn(3, 4).astype(onp.float32)
     z = onp.random.randn(3, 1, 1).astype(onp.float32)
-    device = jax.local_devices()[0]
-    device.TransferToInfeed((y,))
-    device.TransferToInfeed((z,))
+    xla_client.transfer_to_infeed((y,))
+    xla_client.transfer_to_infeed((z,))
     self.assertAllClose(f(x), x + y + z, check_dtypes=True)
 
   def testInfeedThenOutfeed(self):
@@ -59,10 +58,8 @@ class InfeedTest(jax.test_util.JaxTestCase):
     y = onp.random.randn(3, 4).astype(onp.float32)
     execution = threading.Thread(target=lambda: f(x))
     execution.start()
-    device = jax.local_devices()[0]
-    device.TransferToInfeed((y,))
-    out, = device.TransferFromOutfeed(
-      xla_client.shape_from_pyval((y,)).with_major_to_minor_layout_if_absent())
+    xla_client.transfer_to_infeed((y,))
+    out, = xla_client.transfer_from_outfeed(xla_client.shape_from_pyval((y,)))
     execution.join()
     self.assertAllClose(out, y + onp.float32(1), check_dtypes=True)
 
@@ -78,15 +75,13 @@ class InfeedTest(jax.test_util.JaxTestCase):
       token = lax.fori_loop(0, n, doubler, token)
       return lax.tie_in(token, n)
 
-    device = jax.local_devices()[0]
     n = 10
     execution = threading.Thread(target=lambda: f(n))
     execution.start()
     for _ in range(n):
       x = onp.random.randn(3, 4).astype(onp.float32)
-      device.TransferToInfeed((x,))
-      y, = device.TransferFromOutfeed(xla_client.shape_from_pyval((x,))
-                                      .with_major_to_minor_layout_if_absent())
+      xla_client.transfer_to_infeed((x,))
+      y, = xla_client.transfer_from_outfeed(xla_client.shape_from_pyval((x,)))
       self.assertAllClose(y, x * onp.float32(2), check_dtypes=True)
     execution.join()
 

@@ -23,11 +23,9 @@ from jax.core import Primitive
 from jax.interpreters import xla
 from jax.util import prod
 from . import dtypes, lax
-from ..lib import xla_client
+from ..lib.xla_bridge import xla_client
 from ..interpreters import ad
 from ..interpreters import batching
-
-xops = xla_client.ops
 
 __all__ = [
   "fft",
@@ -82,7 +80,7 @@ def fft_abstract_eval(x, fft_type, fft_lengths):
   return ShapedArray(shape, dtype)
 
 def fft_translation_rule(c, x, fft_type, fft_lengths):
-  return xops.Fft(x, fft_type, fft_lengths)
+  return c.Fft(x, fft_type, fft_lengths)
 
 def _naive_rfft(x, fft_lengths):
   y = fft(x, xla_client.FftType.FFT, fft_lengths)
