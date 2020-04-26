@@ -254,13 +254,20 @@ def _while_loop_translation_rule(c, axis_env, name_stack, avals, backend, *args,
   cond_consts, body_consts, init_vals = split_list(args, [cond_nconsts, body_nconsts])
   batched = bool(cond_jaxpr.out_avals[0].shape)
 
+  if xla.jaxpr_uses_outfeed(cond_jaxpr):
+    # TODO: implement the boolean as an extra carry
+    raise NotImplementedError("State not supported in while_loop conditionals")
+
+  uses_outfeed = xla.jaxpr_uses_outfeed(body_jaxpr) or xla.state_carry.FORCE_STATE_WHILE
+  prev_state = xla.state_carry.current_state(c, uses_outfeed)
+
   # Since jaxprs don't have tuples and have multiple return values, but we need
   # the HLO While loop to take a single tuple input and output a single boolean
   # (for the cond computation) or a single tuple output (for the body
   # computation), we build XLA computations that handle the tuple munging before
   # generating a Call into the computations formed from the jaxprs.
 
-  init_carry = xops.Tuple(c, cond_consts + body_consts + init_vals)
+  init_carry = xops.Tuple(c, cond_consts + body_consts + init_vals + prev_state)
 
   cond_c = xb.make_computation_builder("cond_computation")
   cond_carry = xb.parameter(cond_c, 0, c.GetShape(init_carry))
@@ -278,7 +285,8 @@ def _while_loop_translation_rule(c, axis_env, name_stack, avals, backend, *args,
 
   body_c = xb.make_computation_builder("body_computation")
   body_carry = xb.parameter(body_c, 0, c.GetShape(init_carry))
-  body_carry_elts = [xops.GetTupleElement(body_carry, i) for i in range(len(args))]
+  body_carry_elts, _ = xla.state_carry.decompose_tuple_op(
+    body_c, body_carry, len(args), uses_outfeed)
   x, y, z = split_list(body_carry_elts, [cond_nconsts, body_nconsts])
   new_z = xla.jaxpr_subcomp(body_c, body_jaxpr.jaxpr, backend, axis_env,
                             _map(partial(xb.constant, body_c), body_jaxpr.literals),
@@ -289,10 +297,11 @@ def _while_loop_translation_rule(c, axis_env, name_stack, avals, backend, *args,
                                    extend_name_stack(name_stack, 'body_pred'), *(x + z))
     new_z = _map(partial(_pred_bcast_select, body_c, body_pred), new_z, z)
     assert _map(body_c.GetShape, new_z) == _map(body_c.GetShape, z) # no broadcast
-  new_carry = xops.Tuple(body_c, list(itertools.chain(x, y, new_z)))
+  result_state = xla.state_carry.current_state(body_c, uses_outfeed)
+  new_carry = xops.Tuple(body_c, list(itertools.chain(x, y, new_z, result_state)))
 
   ans = xops.While(cond_c.Build(pred), body_c.Build(new_carry), init_carry)
-  ans_elts = [xops.GetTupleElement(ans, i) for i in range(len(args))]
+  ans_elts, _ = xla.state_carry.decompose_tuple_op(c, ans, len(args), uses_outfeed)
   _,  _, z = split_list(ans_elts, [cond_nconsts, body_nconsts])
   return xops.Tuple(c, z)
 
@@ -555,23 +564,34 @@ def _cond_translation_rule(c, axis_env, name_stack, avals, backend,
                            pred, *args, true_jaxpr, false_jaxpr, linear):
   del linear  # Unused.
   true_ops, false_ops = split_list(args, [len(true_jaxpr.in_avals)])
+  uses_outfeed = xla.jaxpr_uses_outfeed(true_jaxpr) or xla.jaxpr_uses_outfeed(false_jaxpr) or xla.state_carry.FORCE_STATE_COND
+  prev_state = xla.state_carry.current_state(c, uses_outfeed)
 
   def make_computation(name, jaxpr, op_shape):
     c = xb.make_computation_builder(name + '_comp')
+
     op = xb.parameter(c, 0, op_shape)
-    ops = [xops.GetTupleElement(op, i) for i in range(len(jaxpr.in_avals))]
+    ops, _ = xla.state_carry.decompose_tuple_op(
+      c, op, len(jaxpr.in_avals), uses_outfeed)
     outs = xla.jaxpr_subcomp(c, jaxpr.jaxpr, backend, axis_env,
                              _map(partial(xb.constant, c), jaxpr.literals),
                              extend_name_stack(name_stack, name + '_fun'), *ops)
-    return c.Build(xops.Tuple(c, outs))
+    result_state = xla.state_carry.current_state(c, uses_outfeed)
+    return c.Build(xops.Tuple(c, list(outs) + result_state))
 
-  true_op = xops.Tuple(c, true_ops)
+  true_op = xops.Tuple(c, true_ops + prev_state)
   true_c = make_computation('true', true_jaxpr, c.GetShape(true_op))
 
-  false_op = xops.Tuple(c, false_ops)
+  false_op = xops.Tuple(c, false_ops + prev_state)
   false_c = make_computation('false', false_jaxpr, c.GetShape(false_op))
-
-  return xops.Conditional(pred, true_op, true_c, false_op, false_c)
+  cond_op = xops.Conditional(pred, true_op, true_c, false_op, false_c)
+  if not uses_outfeed:
+    return cond_op
+  else:
+    nr_outs = len(true_jaxpr.out_avals)
+    regular_outs, _ = xla.state_carry.decompose_tuple_op(
+      c, cond_op, nr_outs, uses_outfeed)
+    return xops.Tuple(c, regular_outs)
 
 def _cond_pred_bcast_select(pred, x, y):
   if core.get_aval(x) is core.get_aval(y) is core.abstract_unit:

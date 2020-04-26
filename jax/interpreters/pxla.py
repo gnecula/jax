@@ -662,6 +662,8 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   xla_args = xla._xla_callable_args(c, sharded_avals, tuple_args)
   out_nodes = xla.jaxpr_subcomp(c, jaxpr, backend, axis_env, xla_consts,
                                 extend_name_stack(wrap_name(name, 'pmap')), *xla_args)
+  uses_outfeed = xla.jaxpr_uses_outfeed(jaxpr)
+  xla.state_carry.end_computation()
   built = c.Build(xops.Tuple(c, out_nodes))
 
   if devices is None:
@@ -717,7 +719,7 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   handle_outs = _pvals_to_results_handler(axis_size, num_local_replicas,
                                           out_pvals, compiled.local_devices(),
                                           backend)
-  return partial(execute_replicated, compiled, backend, handle_args,
+  return partial(execute_replicated, compiled, uses_outfeed, backend, handle_args,
                  handle_outs)
 
 multi_host_supported_collectives: Set[core.Primitive] = set()
@@ -823,7 +825,8 @@ def _pmap_sharding_spec(nrep, axis_size, sharded_aval, mapped):
         replication_factor=replication_factor * axis_size)
 
 
-def execute_replicated(compiled, backend, in_handler, out_handler, *args):
+def execute_replicated(compiled, uses_outfeed: bool, backend, in_handler, out_handler, *args):
+  xla.check_outfeed_allowed(uses_outfeed)
   input_bufs = in_handler(args)
   out_bufs = compiled.ExecuteOnLocalDevices(list(input_bufs))
   return out_handler(out_bufs)

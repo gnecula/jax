@@ -16,7 +16,8 @@
 from collections import defaultdict
 import itertools as it
 import operator as op
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Type
+import threading
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Tuple
 
 from absl import logging
 import numpy as onp
@@ -46,6 +47,11 @@ xops = xc._xla.ops
 # Types
 Backend = Any  # xc.LocalBackend (why does mypy not like this?)
 Device = Any  # xc.Device
+
+XlaOp = Any  # xla_extension.XlaOp
+XlaShape = Any # xla_client.Shape
+XlaComputationBuilder = Any  # xla_bridge._JaxComputationBuilder
+XlaExecutable = Any # xla_extension.LocalExecutable
 
 FLAGS = flags.FLAGS
 flags.DEFINE_bool('jax_debug_nans',
@@ -160,6 +166,89 @@ pytype_aval_mappings: Dict[Any, Callable[[Any], core.AbstractValue]] = {
 pytype_aval_mappings.update((t, make_shaped_array) for t in array_types)
 pytype_aval_mappings.update(
     (t, partial(_make_abstract_python_scalar, t)) for t in _scalar_types)
+
+USE_ADD_DEPENDENCY = False  # We can only use AddDependency once we land the HLO change
+
+# Keep track of which primitives are stateful (they read or read/write state).
+# This helps avoid threading the state through control-flow primitives that
+# do not need it. This is a worthwhile optimization because it seems that XLA
+# may not be good at dealing with tokens (b/154992062).
+outfeed_primitives: Set[core.Primitive] = set()
+def jaxpr_uses_outfeed(jaxpr):
+  """Whether there is a stateful primitive anywhere inside a Jaxpr."""
+  if type(jaxpr) is core.TypedJaxpr:
+    jaxpr = jaxpr.jaxpr
+  for eqn in jaxpr.eqns:
+    if eqn.primitive in outfeed_primitives:
+      return True
+  for subjaxpr in core.subjaxprs(jaxpr):
+    if jaxpr_uses_outfeed(subjaxpr):
+      return True
+  return False
+
+class _ComputationStateCarry(threading.local):
+  """Carries some state globally as we build the HLO.
+
+  For now the state is only a token, obtained from the last OutFeed.
+  The translation rules for primitives can read-write from this class.
+
+  This assumes that the primitives are processed in program-order!
+  """
+  _current_computation: Optional[XlaComputationBuilder]
+  _current_token: Optional[XlaOp]
+
+  # TODO(necula): remove these experiment flags
+  # Flags to force compilation of while, cond, call with in/out state, to
+  # test the XLA compiler's handling of tokens.
+  FORCE_STATE_WHILE = True
+  FORCE_STATE_COND = True
+  FORCE_STATE_CALL = True
+
+  def __init__(self) -> None:
+    self._current_computation = None
+    self._current_token = None
+
+  def end_computation(self):
+    self._current_computation = None
+    self._current_token = None
+
+  def decompose_tuple_op(self, comp: XlaComputationBuilder,
+                         tuple_op: XlaOp, nr_regular: int,
+                         uses_state: bool) -> Tuple[Sequence[XlaOp], Sequence[XlaOp]]:
+    """Decomposes a tuple, returns the regular elements and the state.
+
+    We assume that the `tuple_op` represents a tuple with `nr_regular` regular
+    elements, followed by some elements encoding the state.
+    Stores the new state.
+    """
+    regular_ops = [xops.GetTupleElement(tuple_op, i) for i in range(nr_regular)]
+    if uses_state:
+      self._current_computation = comp
+      self._current_token = xops.GetTupleElement(tuple_op, nr_regular)
+      return regular_ops, self.current_state(comp, uses_state)
+    else:
+      return regular_ops, []
+
+  def current_state(self, comp: XlaComputationBuilder, uses_state: bool) -> List[XlaOp]:
+    """Create new state if new computation, returns the state. """
+    if not uses_state:
+      return []
+    if self._current_computation is None:
+      self._current_computation = comp
+      self._current_token = xops.CreateToken(comp)
+    else:
+      assert comp is self._current_computation, "Overwriting previous computation"
+    return [self._current_token]
+
+  def current_token(self, comp: XlaComputationBuilder) -> XlaOp:
+    state = self.current_state(comp, True)
+    return state[0]
+
+  def set_current_token(self, comp: XlaComputationBuilder, token: XlaOp):
+    assert comp == self._current_computation
+    self._current_token = token
+
+state_carry = _ComputationStateCarry()
 
 ### op-by-op execution
 
@@ -518,6 +607,8 @@ def _xla_callable(fun: lu.WrappedFun, device, backend, name, *arg_specs):
   out_nodes = jaxpr_subcomp(
       c, jaxpr, backend, AxisEnv(nreps, (), ()), xla_consts,
       extend_name_stack(wrap_name(name, 'jit')), *xla_args)
+  uses_outfeed = jaxpr_uses_outfeed(jaxpr)
+  state_carry.end_computation()
   built = c.Build(xops.Tuple(c, out_nodes))
 
   options = xb.get_compile_options(
@@ -529,9 +620,9 @@ def _xla_callable(fun: lu.WrappedFun, device, backend, name, *arg_specs):
   compiled = backend.compile(built, compile_options=options)
 
   if nreps == 1:
-    return partial(_execute_compiled, compiled, result_handlers)
+    return partial(_execute_compiled, compiled, uses_outfeed, result_handlers)
   else:
-    return partial(_execute_replicated, compiled, result_handlers)
+    return partial(_execute_replicated, compiled, uses_outfeed, result_handlers)
 
 def _xla_callable_device(nreps, backend, device, arg_devices):
   if nreps > 1:
@@ -572,14 +663,28 @@ def _pval_to_result_handler(device, pval):
   else:
     return aval_to_result_handler(device, pv)
 
-def _execute_compiled(compiled, handlers, *args):
+_outfeed_allowed = False
+def set_outfeed_allowed(allowed: bool):
+  global _outfeed_allowed
+  _outfeed_allowed = allowed
+
+def check_outfeed_allowed(uses_outfeed: bool):
+  if uses_outfeed and not _outfeed_allowed:
+    raise ValueError("Attempting to execute compiled code using outfeed, "
+                     "but outfeed_consumer is not started.")
+
+def _execute_compiled(compiled: XlaExecutable, uses_outfeed: bool,
+                      handlers, *args):
+  check_outfeed_allowed(uses_outfeed)
   device, = compiled.local_devices()
   input_bufs = [device_put(x, device) for x in args if x is not token]
   out_bufs = compiled.Execute(input_bufs)
   if FLAGS.jax_debug_nans: check_nans(xla_call_p, out_bufs)
   return [handler(out_buf) for handler, out_buf in zip(handlers, out_bufs)]
 
-def _execute_replicated(compiled, handlers, *args):
+def _execute_replicated(compiled: XlaExecutable, uses_outfeed: bool,
+                        handlers, *args):
+  check_outfeed_allowed(uses_outfeed)
   input_bufs = [
       [device_put(x, device) for x in args if x is not token]
       for device in compiled.local_devices()]
@@ -623,11 +728,26 @@ def _xla_call_translation_rule(c, axis_env,
                                call_jaxpr, device=None):
   del device  # Ignored.
   subc = xb.make_computation_builder(f"jit_{name}")
-  args = [xb.parameter(subc, i, c.GetShape(n)) for i, n in enumerate(in_nodes)]
+
+  uses_outfeed = jaxpr_uses_outfeed(call_jaxpr) or state_carry.FORCE_STATE_CALL
+  prev_state = state_carry.current_state(c, uses_outfeed)
+  input_op = xops.Tuple(c, list(in_nodes) + list(prev_state))
+  arg = xb.parameter(subc, 0, c.GetShape(input_op))
+  nr_regular_args = len(in_nodes)
+  args, input_state = state_carry.decompose_tuple_op(subc, arg, nr_regular_args, uses_outfeed)
   out_nodes = jaxpr_subcomp(subc, call_jaxpr, backend, axis_env, (),
-                            extend_name_stack(name_stack, wrap_name(name, 'jit')), *args)
-  subc = subc.Build(xops.Tuple(subc, out_nodes))
-  return xops.Call(c, subc, list(in_nodes))
+                            extend_name_stack(name_stack, wrap_name(name, 'jit')),
+                            *(args + input_state))
+  result_state = state_carry.current_state(subc, uses_outfeed)
+  subc = subc.Build(xops.Tuple(subc, list(out_nodes) + result_state))
+  call_op = xops.Call(c, subc, [input_op])
+  if not uses_outfeed:
+    return call_op
+  nr_outs = len(out_nodes)
+  regular_outs, _ = state_carry.decompose_tuple_op(c, call_op, nr_outs, uses_outfeed)
+  return xops.Tuple(c, regular_outs)
+
+
 ad.primitive_transposes[xla_call_p] = partial(ad.call_transpose, xla_call_p)
 
 
