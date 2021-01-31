@@ -279,7 +279,7 @@ class ShardingSpec:
     # with each dimension having size equal to the number of shards across the corresponding
     # logical array dimension, and each element containing the multi-dimensional index that
     # is used to extract the corresponding shard of the logical array.
-    shard_indices = np.empty([prod(shard_indices_shape)], dtype=np.object)
+    shard_indices = np.empty([prod(shard_indices_shape)], dtype=object)
     for i, idxs in enumerate(it.product(*axis_indices)):
       shard_indices[i] = idxs
     shard_indices = shard_indices.reshape(shard_indices_shape)
@@ -326,7 +326,7 @@ def spec_to_indices(shape: Tuple[int, ...],
     int, a slice object with step=1, or a tuple thereof, to be treated as an
     index into the full logical array.
   """
-  return tuple(spec.indices(shape).flat)
+  return tuple(spec.indices(shape).flat)  # type: ignore
 
 
 ### util

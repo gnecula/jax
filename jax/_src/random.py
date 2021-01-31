@@ -56,7 +56,7 @@ def PRNGKey(seed: int) -> jnp.ndarray:
 
   # Explicitly cast to int64 for JIT invariance of behavior on large ints.
   if isinstance(seed, int):
-    seed = np.int64(seed)
+    seed = np.int64(seed)  # type: ignore[assignment]
   # Converting to jnp.array may truncate bits when jax_enable_x64=False, but this
   # is necessary for the sake of JIT invariance of the result for such values.
   seed = jnp.asarray(seed)
@@ -341,8 +341,8 @@ def _check_shape(name, shape, *param_shapes):
 def uniform(key: jnp.ndarray,
             shape: Sequence[int] = (),
             dtype: np.dtype = dtypes.float_,
-            minval: Union[float, jnp.ndarray] = 0.,
-            maxval: Union[float, jnp.ndarray] = 1.) -> jnp.ndarray:
+            minval: Union[float, np.ndarray] = 0.,
+            maxval: Union[float, np.ndarray] = 1.) -> np.ndarray:
   """Sample uniform random values in [minval, maxval) with given shape/dtype.
 
   Args:
@@ -763,9 +763,9 @@ def _truncated_normal(key, lower, upper, shape, dtype) -> jnp.ndarray:
       lax.nextafter(lax.stop_gradient(upper), np.array(-np.inf, dtype=dtype)))
 
 
-def bernoulli(key: jnp.ndarray,
-              p: jnp.ndarray = np.float32(0.5),
-              shape: Optional[Sequence[int]] = None) -> jnp.ndarray:
+def bernoulli(key: np.ndarray,
+              p: Union[float, np.ndarray] = np.array(0.5, dtype=np.float32),
+              shape: Optional[Sequence[int]] = None) -> np.ndarray:
   """Sample Bernoulli random values with given shape and mean.
 
   Args:
@@ -800,8 +800,8 @@ def _bernoulli(key, p, shape) -> jnp.ndarray:
 
 
 def beta(key: jnp.ndarray,
-         a: Union[float, jnp.ndarray],
-         b: Union[float, jnp.ndarray],
+         a: Union[float, np.ndarray],
+         b: Union[float, np.ndarray],
          shape: Optional[Sequence[int]] = None,
          dtype: np.dtype = dtypes.float_) -> jnp.ndarray:
   """Sample Beta random values with given shape and float dtype.
