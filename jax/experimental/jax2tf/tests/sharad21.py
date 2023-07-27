@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import inspect
 import types
 import typing
+from typing import Union
 
 import numpy as np
 
@@ -10,6 +12,8 @@ from jax._src import core
 from jax._src.util import safe_zip, safe_map
 import jax
 import jax.numpy as jnp
+
+from jax.experimental.jax2tf import jax_export
 
 zip, unsafe_zip = safe_zip, zip
 map, unsafe_map = safe_map, map
@@ -24,55 +28,82 @@ else:
     def __init__(self, dtype):
       self.dtype = dtype
 
-    def __getitem__(self, stuff):
-      if type(stuff) is not tuple:
-        stuff = (stuff,)
-      return types.SimpleNamespace(shape=stuff, dtype=self.dtype)
+    def __getitem__(self, dims: tuple[Union[int, str]]) -> jax.ShapeDtypeStruct:
+      if type(dims) is not tuple:
+        dims = (dims,)
+      return jax_export.poly_spec(
+        (None,) * len(dims),  # not needed
+        self.dtype,
+        ",".join(str(d) for d in dims))
+
   f32 = dtype(jnp.dtype('float32'))
 
 
 def shapecheck(f):
   try: sig = inspect.signature(f)
   except: return
-  def subst_vars(ty):
-    new_shape = tuple(0 if type(d) is not int else d for d in ty.shape)
-    return types.SimpleNamespace(shape=new_shape, dtype=ty.dtype)
 
-  dummy_args = [np.zeros(ty.shape, ty.dtype)
-                for param in sig.parameters.values()
-                for ty in [subst_vars(eval(param.annotation))]]
-  abstracted_axes_ = [eval(param.annotation).shape
-                      for param in sig.parameters.values()]
-  abstracted_axes = [{i:n for i, n in enumerate(ax) if type(n) is not int}
-                     for ax in abstracted_axes_]
+  dummy_args: Sequence[jax.ShapeDtypeStruct] = [
+    eval(param.annotation) for param in sig.parameters.values()]
 
-  jaxpr = jax.make_jaxpr(f, abstracted_axes=tuple(abstracted_axes))(*dummy_args)
+  jaxpr = jax.make_jaxpr(f)(*dummy_args)
+  computed_shape_dtype, = jaxpr.out_avals
 
-  out_type, = jaxpr.out_avals
+  expected_shape_dtype: jax.ShapeDtypeStruct = eval(sig.return_annotation)
+  if computed_shape_dtype.shape != expected_shape_dtype.shape:
+    raise TypeError(f"Expected {expected_shape_dtype.shape}, found {computed_shape_dtype.shape}")
 
-  num_dim_vars = len({d for ann in abstracted_axes for d in ann.values()})
-  env = {jaxpr_var:ann[i]
-         for v, ann in zip(jaxpr.jaxpr.invars[num_dim_vars:], abstracted_axes)
-         for i, jaxpr_var in enumerate(v.aval.shape)
-         if type(jaxpr_var) is core.Var}
-  annotation_shape = eval(sig.return_annotation).shape
-  v, = jaxpr.jaxpr.outvars
-  computed_shape = tuple(env.get(d, d) for d in v.aval.shape)
-  if computed_shape != annotation_shape: raise Exception
   return f
 
 ###
 
-def axis_size_vars(*args):
-  return args
+def test_simple():
+  @shapecheck
+  def f(x: f32[3, "n"], y:f32[3, "n"]) -> f32[3]:
+    z = jnp.dot(x, y.T)
+    w = jnp.tanh(z)
+    return w.sum(0)
 
-m, k, n = axis_size_vars('m', 'k', 'n')
+def test_batched():
+  @shapecheck
+  def f(x: f32["b", "n"], y:f32["b", "n"]) -> f32["b"]:
+    z = jnp.dot(x, y.T)
+    w = jnp.tanh(z)
+    return w.sum(0)
 
-@shapecheck
-def f(x: f32[3, n], y:f32[3, n]) -> f32[3]:
-  z = jnp.dot(x, y.T)
-  w = jnp.tanh(z)
-  return w.sum(0)
+def test_reshape():
+  @shapecheck
+  def f(x: f32["b", "n"], y:f32["b", "n"]) -> f32[2, "b*n"]:
+    z = jnp.concatenate([x, y], axis=1)
+    w = jnp.reshape(z, (2, -1))
+    return w
+
+def test_vmap():
+  @shapecheck
+  def f(x: f32["n"], y:f32["n"]) -> f32[2]:
+    z = jnp.concatenate([x, y], axis=0)
+    return z.reshape((2, -1)).sum(axis=1)
+
+  @shapecheck
+  def vf(x: f32["b", "n"], y:f32["b", "n"]) -> f32["b", 2]:
+    return jax.vmap(f)(x, y)
+
+
+def test_vmap_better():
+  # TODO: change jax.vmap to add new axes to the shapecheck specification
+  @shapecheck
+  @jax.vmap
+  def f(x: f32["n"], y:f32["n"]) -> f32[2]:
+    z = jnp.concatenate([x, y], axis=0)
+    return z.reshape((2, -1)).sum(axis=1)
+
+def test_multiple_outputs():
+  # TODO: handle multiple outputs
+  @shapecheck
+  def f(x: f32["b", "n"]) -> tuple[f32["b"], f32["n"]]:
+    return (jnp.sum(x, axis=0),
+            jnp.sum(x, axis=1))
+
 
 # TODO [ ] handle let-bound dynamic shapes (ie output dim vars)
 # TODO [ ] handle multiple outputs
@@ -80,3 +111,4 @@ def f(x: f32[3, n], y:f32[3, n]) -> f32[3]:
 # TODO [ ] clean up
 # TODO [ ] mapping to python variables, set trace
 # TODO [ ] editor integration of some kind
+# TODO [ ] handle vmap
