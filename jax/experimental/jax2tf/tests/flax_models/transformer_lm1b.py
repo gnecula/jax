@@ -26,6 +26,8 @@ from typing import Callable, Any, Optional
 
 from flax import linen as nn
 from flax import struct
+
+import jax._src.core
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
@@ -90,12 +92,14 @@ def sinusoidal_init(max_len=2048,
     """Sinusoidal init."""
     del key, dtype
     d_feature = shape[-1]
-    pe = np.zeros((max_len, d_feature), dtype=np.float32)
-    position = np.arange(0, max_len)[:, np.newaxis]
+    pe = jnp.zeros((max_len, d_feature), dtype=np.float32)
+    position = jnp.arange(0, max_len)[:, np.newaxis]
     scale_factor = -np.log(max_scale / min_scale) / (d_feature // 2 - 1)
-    div_term = min_scale * np.exp(np.arange(0, d_feature // 2) * scale_factor)
-    pe[:, :d_feature // 2] = np.sin(position * div_term)
-    pe[:, d_feature // 2: 2 * (d_feature // 2)] = np.cos(position * div_term)
+    div_term = min_scale * jnp.exp(jnp.arange(0, d_feature // 2) * scale_factor)
+    # pe[:, :d_feature // 2] = jnp.sin(position * div_term)
+    pe = lax.dynamic_update_slice_in_dim(pe, jnp.sin(position * div_term), 0, axis=1)
+    # pe[:, d_feature // 2: 2 * (d_feature // 2)] = np.cos(position * div_term)
+    pe = lax.dynamic_update_slice_in_dim(pe, jnp.cos(position * div_term), d_feature // 2, axis=1)
     pe = pe[np.newaxis, :, :]  # [1, max_len, d_feature]
     return jnp.array(pe)
 
@@ -143,7 +147,11 @@ class AddPositionEmbs(nn.Module):
     else:
       pos_embedding = self.param('pos_embedding', config.posemb_init,
                                  pos_emb_shape)
-    pe = pos_embedding[:, :length, :]
+    # TODO: fix this
+    if jax.core.is_constant_dim(length) and jax.core.is_constant_dim(pos_embedding.shape[1]):
+      pe = pos_embedding[:, :length, :]
+    else:
+      pe = lax.dynamic_slice_in_dim(pos_embedding, 0, length, axis=1)
 
     # We use a cache position index for tracking decoding position.
     if self.decode:

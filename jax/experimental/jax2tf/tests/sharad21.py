@@ -212,6 +212,88 @@ def test_flax_cnn_parameterized():
   prediction_shape = jax.eval_shape(model.apply, variables_shapes, x_shape)
   assert str(prediction_shape.shape) == "(b, f2)"
 
+@jtu.ignore_warning(category=DeprecationWarning, message=".* deprecated")
+def test_flax_lm1b_parameterized():
+  from flax_models import transformer_lm1b as lm1b
+
+  def _min_transformer_kwargs():
+    return dict(
+      vocab_size=8,
+      output_vocab_size=8,
+      emb_dim=4,
+      num_heads=1,
+      num_layers=1,
+      qkv_dim=2,
+      mlp_dim=2,
+      max_len=2,
+      dropout_rate=0.,
+      attention_dropout_rate=0.)
+
+  def _full_transformer_kwargs():
+    kwargs = dict(
+      decode=True,
+      deterministic=True,
+      logits_via_embedding=False,
+      share_embeddings=False
+    )
+    return {**kwargs, **_min_transformer_kwargs()}
+
+  config = lm1b.TransformerConfig(**_full_transformer_kwargs())
+  model = lm1b.TransformerLM(config=config)
+  x = np.zeros((2, 1), np.float32)
+  rng1, rng2 = jax.random.split(jax.random.key(0))
+  variables = model.init(rng1, x)
+
+  def apply(*args):
+    # Don't return the new state (containing the cache).
+    output, _ = model.apply(*args, rngs={'cache': rng2}, mutable=['cache'])
+    return output
+
+  prediction = apply(variables, x)
+
+  # Now create a model with symbolic configuration
+  v, l = export.parse_shape("V, L")
+  model_symbolic_config = lm1b.TransformerConfig(
+    **dict(_full_transformer_kwargs(),
+           vocab_size=v, output_vocab_size=v,
+           max_len=l))
+  model = lm1b.TransformerLM(config=model_symbolic_config)
+  x_shape = jax.ShapeDtypeStruct(
+    # TODO: improve error messages if we don't use multiple of 4 for height and width
+    export.parse_shape("B, 1"),
+    x.dtype)
+  variable_shapes = jax.eval_shape(model.init, rng1, x_shape)
+  assert jax.tree_map(lambda v: str(v.shape), variable_shapes) == {
+    'cache': {
+      'decoder': {
+        'encoderdecoderblock_0': {
+          'SelfAttention_0': {
+            'cache_index': '()',
+            'cached_key': '(B, 1, 1, 2)',
+            'cached_value': '(B, 1, 1, 2)'}},
+        'posembed_output': {
+          'cache_index': '()'}}},
+    'params': {
+      'decoder': {
+        'Embed_0': {'embedding': '(V, 4)'},
+        'encoderdecoder_norm': {'bias': '(4,)', 'scale': '(4,)'},
+        'encoderdecoderblock_0': {
+          'LayerNorm_0': {'bias': '(4,)', 'scale': '(4,)'},
+          'LayerNorm_1': {'bias': '(4,)', 'scale': '(4,)'},
+          'MlpBlock_0': {
+            'Dense_0': {'bias': '(2,)', 'kernel': '(4, 2)'},
+            'Dense_1': {'bias': '(4,)', 'kernel': '(2, 4)'}},
+          'SelfAttention_0': {
+            'key': {
+              'kernel': '(4, 1, 2)'},
+            'out': {
+              'kernel': '(1, 2, 4)'},
+            'query': {'kernel': '(4, 1, 2)'},
+            'value': {'kernel': '(4, 1, 2)'}}},
+        'logitdense': {'bias': '(V,)', 'kernel': '(4, V)'}}}}
+  prediction_shapes = jax.eval_shape(apply, variable_shapes, x_shape)
+  assert str(prediction_shapes.shape) == '(B, 1, V)'
+  stop = 1
 
 # TODO [ ] handle let-bound dynamic shapes (ie output dim vars)
 # TODO [ ] handle multiple outputs
